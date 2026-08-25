@@ -174,7 +174,7 @@ class Contract(gl.Contract):
             self.total_locked_funds = bigint(0)
 
         if refund_amt > bigint(0):
-            gl.get_contract_at(Address(order.buyer)).emit_transfer(value=u256(refund_amt))
+            gl.get_contract_at(Address(order.buyer)).emit_transfer(value=refund_amt)
 
     @gl.public.write
     def submit_and_verify(
@@ -315,9 +315,9 @@ OUTPUT ONLY JSON:
             seller_payout = deposit_amt - fee
 
             if fee > bigint(0):
-                gl.get_contract_at(self._treasury()).emit_transfer(value=u256(fee))
+                gl.get_contract_at(self._treasury()).emit_transfer(value=fee)
             if seller_payout > bigint(0):
-                gl.get_contract_at(seller_addr).emit_transfer(value=u256(seller_payout))
+                gl.get_contract_at(seller_addr).emit_transfer(value=seller_payout)
 
             order.status = "SETTLED"
             if self.total_locked_funds >= deposit_amt:
@@ -328,7 +328,7 @@ OUTPUT ONLY JSON:
         elif verdict == "REJECTED":
             # Fraudulent or invalid proof: 100% refund back to buyer
             if deposit_amt > bigint(0):
-                gl.get_contract_at(buyer_addr).emit_transfer(value=u256(deposit_amt))
+                gl.get_contract_at(buyer_addr).emit_transfer(value=deposit_amt)
 
             order.status = "REFUNDED"
             if self.total_locked_funds >= deposit_amt:
@@ -371,16 +371,16 @@ OUTPUT ONLY JSON:
             seller_payout = deposit_amt - fee
 
             if fee > bigint(0):
-                gl.get_contract_at(self._treasury()).emit_transfer(value=u256(fee))
+                gl.get_contract_at(self._treasury()).emit_transfer(value=fee)
             if seller_payout > bigint(0):
-                gl.get_contract_at(seller_addr).emit_transfer(value=u256(seller_payout))
+                gl.get_contract_at(seller_addr).emit_transfer(value=seller_payout)
 
             order.status = "SETTLED"
             order.verdict = "RESOLVED_MANUALLY_RELEASED"
             order.reason = f"Escalated order settled: Funds released to seller by {sender}"
         else:
             if deposit_amt > bigint(0):
-                gl.get_contract_at(buyer_addr).emit_transfer(value=u256(deposit_amt))
+                gl.get_contract_at(buyer_addr).emit_transfer(value=deposit_amt)
 
             order.status = "REFUNDED"
             order.verdict = "RESOLVED_MANUALLY_REFUNDED"
