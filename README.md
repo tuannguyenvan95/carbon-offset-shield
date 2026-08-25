@@ -13,7 +13,7 @@ Traditional smart contracts cannot read external web pages or evaluate natural l
 
 ## Deployment Information
 * **Network:** studionet (GenLayer Studio Network)
-* **Contract Address:** 0xE9Be93310b0Eb4e2fBBb45FaF5164794dFFD59a5
+* **Contract Address:** 0x8339e9F20f898f9EaF597359dD7174bc4db28e76
 
 ---
 
