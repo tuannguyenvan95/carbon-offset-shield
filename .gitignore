@@ -4,3 +4,5 @@ __pycache__/
 artifacts/
 .pytest_cache/
 *.pyc
+push_to_github.py
+
