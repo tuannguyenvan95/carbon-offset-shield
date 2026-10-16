@@ -27,7 +27,7 @@ def _parse_llm_json(text) -> dict:
             cleaned = cleaned[:-3]
         return json.loads(cleaned.strip())
     except Exception as e:
-        return {"verdict": "ABORT", "confidence": 0, "reason": f"Parse error: {str(e)}"}
+        return {"verdict": "ABORT", "confidence": 0, "reason": f"Parse error: {str(e)}", "standard": "OTHER", "serial_number": ""}
 
 
 def _safe_parse(raw) -> dict:
@@ -36,7 +36,7 @@ def _safe_parse(raw) -> dict:
         return None
 
     verdict = str(data.get("verdict", "")).strip().upper()
-    if verdict not in ("VERIFIED_RETIRED", "REJECTED", "ABORT"):
+    if verdict not in ("VERIFIED_RETIRED", "REJECTED", "INSUFFICIENT_DATA", "ABORT"):
         return None
 
     conf = data.get("confidence", 0)
@@ -46,6 +46,8 @@ def _safe_parse(raw) -> dict:
         return None
 
     reason = str(data.get("reason", ""))
+    standard = str(data.get("standard", "OTHER")).strip().upper()
+    serial_number = str(data.get("serial_number", "")).strip().upper()
 
     # Bind confidence directly to verdict: Low confidence falls back to ABORT
     if conf < 65 and verdict != "ABORT":
@@ -56,6 +58,8 @@ def _safe_parse(raw) -> dict:
         "verdict": verdict,
         "confidence": conf,
         "reason": reason[:300],
+        "standard": standard[:50],
+        "serial_number": serial_number[:100],
     }
 
 
@@ -70,10 +74,13 @@ class CarbonOrder:
     registry_url: str
     certificate_url: str
     deposit_amount: bigint
-    status: str       # OPEN | AUDITING | SETTLED | REFUNDED | ESCALATED
-    verdict: str      # VERIFIED_RETIRED | REJECTED | ABORT
+    status: str       # OPEN | SUBMITTED | INSUFFICIENT_DATA | AUDITING | SETTLED | REFUNDED | ESCALATED
+    verdict: str      # VERIFIED_RETIRED | REJECTED | INSUFFICIENT_DATA | ABORT | REJECTED_DUPLICATE_SERIAL | TIMEOUT_REFUNDED
     confidence: bigint
     reason: str
+    standard: str
+    serial_number: str
+    deadline: bigint
 
 
 class Contract(gl.Contract):
@@ -81,6 +88,7 @@ class Contract(gl.Contract):
     order_counter: bigint
     treasury_address: str
     total_locked_funds: bigint
+    claimed_serials: TreeMap[str, str]
 
     def __init__(self, treasury_addr: str):
         self.order_counter = bigint(0)
@@ -103,12 +111,22 @@ class Contract(gl.Contract):
         u = url.strip().lower()
         return u.startswith("http://") or u.startswith("https://")
 
+    def _now(self) -> bigint:
+        try:
+            return bigint(gl.block.timestamp)
+        except Exception:
+            try:
+                return bigint(gl.message.timestamp)
+            except Exception:
+                return bigint(0)
+
     @gl.public.write.payable
     def create_order(
         self,
         seller_addr: str,
         beneficiary_name: str,
         min_tonnes: int,
+        deadline_duration_seconds: int = 259200,
     ) -> str:
         """Buyer deposits purchase funds into escrow for verifiable carbon credit retirement."""
         deposit = gl.message.value
@@ -129,9 +147,12 @@ class Contract(gl.Contract):
             raise UserError("Beneficiary name too short")
         if min_tonnes <= 0:
             raise UserError("min_tonnes must be greater than 0")
+        if deadline_duration_seconds <= 0:
+            raise UserError("deadline_duration_seconds must be greater than 0")
 
         self.order_counter += bigint(1)
         oid = str(self.order_counter)
+        order_deadline = self._now() + bigint(deadline_duration_seconds)
 
         self.orders[oid] = CarbonOrder(
             id=oid,
@@ -146,6 +167,9 @@ class Contract(gl.Contract):
             verdict="",
             confidence=bigint(0),
             reason="",
+            standard="",
+            serial_number="",
+            deadline=order_deadline,
         )
         self.total_locked_funds += deposit
         return oid
@@ -177,18 +201,51 @@ class Contract(gl.Contract):
             gl.get_contract_at(Address(order.buyer)).emit_transfer(value=refund_amt)
 
     @gl.public.write
+    def claim_timeout_refund(self, order_id: str) -> None:
+        """Bounded recovery path: buyer reclaims escrow if deadline has expired and proof is unfulfilled or insufficient."""
+        if order_id not in self.orders:
+            raise UserError("Order not found")
+        order = self.orders[order_id]
+
+        sender = _addr_str(gl.message.sender_address).lower()
+        if sender != order.buyer.lower():
+            raise UserError("Only buyer can claim timeout refund")
+
+        if order.status not in ("OPEN", "SUBMITTED", "INSUFFICIENT_DATA", "AUDITING", "ESCALATED"):
+            raise UserError(f"Cannot claim timeout refund for order in status {order.status}")
+
+        curr_time = self._now()
+        if curr_time < order.deadline:
+            raise UserError("Order deadline has not expired yet")
+
+        deposit_amt = order.deposit_amount
+        order.status = "REFUNDED"
+        order.verdict = "TIMEOUT_REFUNDED"
+        order.reason = "Escrow recovered by buyer: deadline expired without valid retirement proof"
+        self.orders[order_id] = order
+
+        if self.total_locked_funds >= deposit_amt:
+            self.total_locked_funds -= deposit_amt
+        else:
+            self.total_locked_funds = bigint(0)
+
+        if deposit_amt > bigint(0):
+            gl.get_contract_at(Address(order.buyer)).emit_transfer(value=deposit_amt)
+
+    @gl.public.write
     def submit_and_verify(
         self,
         order_id: str,
         registry_url: str,
         certificate_url: str,
     ) -> None:
-        """Seller submits live Registry / Certificate links, triggering autonomous AI consensus verification."""
+        """Seller submits/corrects live Registry and Certificate links, triggering autonomous AI consensus verification."""
         if order_id not in self.orders:
             raise UserError("Order not found")
         order = self.orders[order_id]
 
-        if order.status not in ("OPEN", "ESCALATED"):
+        # Allowed lifecycle states: initial submission or correction after INSUFFICIENT_DATA / ESCALATED
+        if order.status not in ("OPEN", "SUBMITTED", "INSUFFICIENT_DATA", "ESCALATED"):
             raise UserError("Order is not available for verification")
 
         sender = _addr_str(gl.message.sender_address).lower()
@@ -226,7 +283,13 @@ class Contract(gl.Contract):
                         pass
 
             if not proof_texts:
-                return {"verdict": "ABORT", "confidence": 0, "reason": "All carbon registry fetch calls failed"}
+                return {
+                    "verdict": "ABORT",
+                    "confidence": 0,
+                    "reason": "All carbon registry fetch calls failed",
+                    "standard": "OTHER",
+                    "serial_number": "",
+                }
 
             prompt = f"""
 SYSTEM: You are a strict Environmental & Carbon Credit Registry Verification Auditor.
@@ -239,13 +302,16 @@ OFFICIAL REGISTRY & CERTIFICATE PROOFS:
 {"\n\n".join(proof_texts)}
 
 Rules:
-- VERIFIED_RETIRED (conf >= 75): Status is explicitly "RETIRED" or "CANCELLED" (permanently out of circulation), quantity >= {m_tonnes}, and beneficiary matches "{b_name}".
-- REJECTED (conf >= 75): Credit is "ACTIVE" (not retired), quantity is insufficient, wrong beneficiary, or fake certificate.
+- VERIFIED_RETIRED (conf >= 75): Status is explicitly "RETIRED" or "CANCELLED" (permanently out of circulation), quantity >= {m_tonnes}, beneficiary matches "{b_name}", and standard/serial are clearly identifiable.
+- REJECTED (conf >= 75): Credit is "ACTIVE" (not retired), quantity is insufficient, wrong beneficiary, or fraudulent certificate.
+- INSUFFICIENT_DATA (conf >= 70): Document is partially readable but missing critical verification fields (e.g. serial number cannot be located, beneficiary field is truncated/unspecified, or volume units are ambiguous), requiring seller correction.
 - ABORT: Registry page is paywalled, 404, rate-limited, captcha-blocked, or unreadable.
 
 OUTPUT ONLY JSON:
 {{
-  "verdict": "VERIFIED_RETIRED" | "REJECTED" | "ABORT",
+  "verdict": "VERIFIED_RETIRED" | "REJECTED" | "INSUFFICIENT_DATA" | "ABORT",
+  "standard": "VERRA" | "GOLD_STANDARD" | "ACR" | "CAR" | "OTHER",
+  "serial_number": "string serial number or unique batch identifier (e.g. 1234-5678-VCS)",
   "confidence": 0-100,
   "reason": "max 300 chars technical explanation"
 }}
@@ -258,15 +324,33 @@ OUTPUT ONLY JSON:
                 p2 = _safe_parse(raw2)
 
                 if p1 is None or p2 is None:
-                    return {"verdict": "ABORT", "confidence": 0, "reason": "parse_failed"}
+                    return {
+                        "verdict": "ABORT",
+                        "confidence": 0,
+                        "reason": "parse_failed",
+                        "standard": "OTHER",
+                        "serial_number": "",
+                    }
 
                 if p1["verdict"] != p2["verdict"]:
-                    return {"verdict": "ABORT", "confidence": 0, "reason": "multi_sample_divergence"}
+                    return {
+                        "verdict": "ABORT",
+                        "confidence": 0,
+                        "reason": "multi_sample_divergence",
+                        "standard": "OTHER",
+                        "serial_number": "",
+                    }
 
                 p1["confidence"] = (p1["confidence"] + p2["confidence"]) // 2
                 return p1
             except Exception as e:
-                return {"verdict": "ABORT", "confidence": 0, "reason": f"LLM error: {str(e)}"}
+                return {
+                    "verdict": "ABORT",
+                    "confidence": 0,
+                    "reason": f"LLM error: {str(e)}",
+                    "standard": "OTHER",
+                    "serial_number": "",
+                }
 
         def validator_fn(leader_res) -> bool:
             if not isinstance(leader_res, gl.vm.Return):
@@ -282,20 +366,33 @@ OUTPUT ONLY JSON:
                 return False
 
             # Agree on verdict and confidence threshold bucket
-            return (
-                mine["verdict"] == leader["verdict"]
-                and (mine["confidence"] >= 65) == (leader["confidence"] >= 65)
-            )
+            verdicts_match = (mine["verdict"] == leader["verdict"])
+            conf_buckets_match = ((mine["confidence"] >= 65) == (leader["confidence"] >= 65))
+
+            # For verified retirements, ensure agreement on standard and serial
+            if verdicts_match and mine["verdict"] == "VERIFIED_RETIRED":
+                serials_match = (mine["serial_number"] == leader["serial_number"])
+                return verdicts_match and conf_buckets_match and serials_match
+
+            return verdicts_match and conf_buckets_match
 
         result_raw = gl.vm.run_nondet(leader_fn, validator_fn)
         result = _safe_parse(result_raw)
 
         if result is None:
-            result = {"verdict": "ABORT", "confidence": 0, "reason": "adjudication_failed"}
+            result = {
+                "verdict": "ABORT",
+                "confidence": 0,
+                "reason": "adjudication_failed",
+                "standard": "OTHER",
+                "serial_number": "",
+            }
 
         verdict = result["verdict"]
         confidence = result["confidence"]
         reason = result["reason"]
+        standard = result["standard"]
+        serial_number = result["serial_number"]
 
         # Post-consensus deterministic normalization
         if confidence < 65 and verdict != "ABORT":
@@ -304,12 +401,39 @@ OUTPUT ONLY JSON:
         order.verdict = verdict
         order.confidence = bigint(confidence)
         order.reason = reason
+        order.standard = standard
+        order.serial_number = serial_number
 
         deposit_amt = order.deposit_amount
         seller_addr = Address(order.seller)
         buyer_addr = Address(order.buyer)
 
         if verdict == "VERIFIED_RETIRED":
+            # Concurrent/double-spending protection: check if serial was already claimed
+            serial_key = f"{standard}:{serial_number}" if serial_number else ""
+            if serial_key and (serial_key in self.claimed_serials):
+                claimed_by = self.claimed_serials[serial_key]
+                if claimed_by != order_id:
+                    # CONFLICT DETECTED: Serial already used in another settled order!
+                    # Safe outcome: Refund 100% of escrow back to buyer, block seller payout
+                    order.status = "REFUNDED"
+                    order.verdict = "REJECTED_DUPLICATE_SERIAL"
+                    order.reason = f"Conflict: Serial {serial_key} already claimed by order #{claimed_by}. Escrow refunded to buyer."
+                    if deposit_amt > bigint(0):
+                        gl.get_contract_at(buyer_addr).emit_transfer(value=deposit_amt)
+
+                    if self.total_locked_funds >= deposit_amt:
+                        self.total_locked_funds -= deposit_amt
+                    else:
+                        self.total_locked_funds = bigint(0)
+
+                    self.orders[order_id] = order
+                    return
+
+            # Register serial as permanently claimed
+            if serial_key:
+                self.claimed_serials[serial_key] = order_id
+
             # Successful verification: 2% protocol fee to treasury, 98% to seller
             fee = (deposit_amt * bigint(2)) // bigint(100)
             seller_payout = deposit_amt - fee
@@ -335,6 +459,10 @@ OUTPUT ONLY JSON:
                 self.total_locked_funds -= deposit_amt
             else:
                 self.total_locked_funds = bigint(0)
+
+        elif verdict == "INSUFFICIENT_DATA":
+            # Incomplete evidence: transition to INSUFFICIENT_DATA so seller can correct/resubmit proof before deadline
+            order.status = "INSUFFICIENT_DATA"
 
         else:
             # ABORT: Network/fetch error, route to ESCALATED for safe retry or authorized manual resolution
@@ -367,6 +495,15 @@ OUTPUT ONLY JSON:
         buyer_addr = Address(order.buyer)
 
         if release_to_seller:
+            # Record serial if provided
+            serial_key = f"{order.standard}:{order.serial_number}" if (order.standard and order.serial_number) else ""
+            if serial_key and (serial_key in self.claimed_serials):
+                claimed_by = self.claimed_serials[serial_key]
+                if claimed_by != order_id:
+                    raise UserError(f"Cannot release: serial {serial_key} already claimed by order #{claimed_by}")
+            if serial_key:
+                self.claimed_serials[serial_key] = order_id
+
             fee = (deposit_amt * bigint(2)) // bigint(100)
             seller_payout = deposit_amt - fee
 
@@ -411,7 +548,18 @@ OUTPUT ONLY JSON:
             "verdict": o.verdict,
             "confidence": str(o.confidence),
             "reason": o.reason,
+            "standard": o.standard,
+            "serial_number": o.serial_number,
+            "deadline": str(o.deadline),
         })
+
+    @gl.public.view
+    def get_claimed_serial(self, serial_key: str) -> str:
+        """Returns the order_id that permanently settled and claimed the given standard:serial key."""
+        k = serial_key.strip().upper()
+        if k in self.claimed_serials:
+            return self.claimed_serials[k]
+        return ""
 
     @gl.public.view
     def get_order_counter(self) -> int:
@@ -423,7 +571,7 @@ OUTPUT ONLY JSON:
 
     @gl.public.view
     def get_all_orders(self) -> str:
-        """Returns a JSON-serialized list of all orders for frontend rendering."""
+        """Returns a JSON-serialized list of all orders for indexing and explorer queries."""
         order_list = []
         count = int(self.order_counter)
         for i in range(1, count + 1):
@@ -443,5 +591,8 @@ OUTPUT ONLY JSON:
                     "verdict": o.verdict,
                     "confidence": str(o.confidence),
                     "reason": o.reason,
+                    "standard": o.standard,
+                    "serial_number": o.serial_number,
+                    "deadline": str(o.deadline),
                 })
         return json.dumps(order_list)
